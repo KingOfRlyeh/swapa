@@ -27,11 +27,19 @@ def triangle_colorings(G, aut_cap=20000):
     SILENT when Delta == 0 -- a swap can preserve triangle count yet still change
     the graph (e.g. alter 4-cycle count or disconnect it). Those Delta == 0 pairs
     are resolved by an isomorphism check (sc.complete_conflicts), exactly as
-    swapcolor does, so the coloring here has no residual swap failures."""
+    swapcolor does, so the coloring here has no residual swap failures.
+
+    Also returns safe_switches: for every pair the analysis found FREE (allowed
+    to share a bond type) despite having at least one non-isomorphic switch, the
+    list of that pair's isomorphic (v,w,s,t) reconnections -- i.e. the only
+    orientations that pair may realize. Graph-level, independent of which
+    coloring/orientation is later chosen; lets stage 3 reject a doomed
+    orientation with a cheap lookup instead of a fresh isomorphism check."""
     _, H, ambiguous = sc.analyze(G)
-    Hstar, _ = sc.complete_conflicts(G, H, ambiguous)   # resolve Delta==0 pairs
+    Hstar, _, safe_switches = sc.complete_conflicts(G, H, ambiguous)   # resolve Delta==0 pairs
     k, parts = sc.chromatic_and_colorings(Hstar)
-    reps = sc.dedupe_under_aut(parts, sc.automorphisms(G, cap=aut_cap)) if parts else []
+    auts = sc.automorphisms(G, cap=aut_cap)
+    reps = sc.dedupe_under_aut(parts, auts) if parts else []
     colorings = []
     for part in reps:
         cd = {}
@@ -39,13 +47,78 @@ def triangle_colorings(G, aut_cap=20000):
             for e in cl:
                 cd[sc.ekey(*e)] = i
         colorings.append(cd)
-    return k, colorings, Hstar
+    return k, colorings, Hstar, safe_switches, auts
 
 # ============================================================
 #  Stage 2: orientations (loop rule)
 # ============================================================
 
-def orientations(G, coloring):
+def _coloring_stabilizer(G, coloring, auts):
+    """The subgroup of `auts` (automorphisms of G) that maps this coloring's
+    color-class PARTITION onto itself -- as a set of edge-sets, ignoring which
+    numeric color id lands where, since bond-type labels are arbitrary. Always
+    includes the identity."""
+    class_sets = [frozenset(cl) for cl in color_classes(G, coloring).values()]
+    stab = []
+    for a in auts:
+        ok = True
+        for cl in class_sets:
+            img = frozenset(sc.ekey(a[u], a[v]) for (u, v) in cl)
+            if img not in class_sets:
+                ok = False; break
+        if ok:
+            stab.append(a)
+    return stab
+
+
+def _component_action(a, comps):
+    """How stabilizer automorphism `a` acts on the free-component flip-vector:
+    component i's chosen side maps onto component perm[i]'s side, XORed with
+    flipbits[i] (0 = preserves which side is the source, 1 = swaps it). Well
+    defined because a connected bipartite graph's 2-coloring is unique up to a
+    single global swap, so one sample vertex per component fixes the bit for
+    the whole component."""
+    edge_sets = [frozenset(ce) for ce, _ in comps]
+    perm = [None] * len(comps)
+    flipbits = [0] * len(comps)
+    for i, (cedges, side) in enumerate(comps):
+        image = frozenset(sc.ekey(a[u], a[v]) for (u, v) in cedges)
+        j = edge_sets.index(image)
+        perm[i] = j
+        v = cedges[0][0]
+        flipbits[i] = 0 if side[v] == comps[j][1][a[v]] else 1
+    return perm, flipbits
+
+
+def _flip_orbits(m, actions):
+    """Orbit representatives of {0,1}^m (as bit-tuples) under the group action
+    given by `actions` (a list of (perm, flipbits) pairs, one per generator)."""
+    total = 1 << m
+    visited = [False] * total
+    reps = []
+    for start in range(total):
+        if visited[start]:
+            continue
+        reps.append(start)
+        visited[start] = True
+        frontier = [start]
+        while frontier:
+            cur = frontier.pop()
+            bits = [(cur >> k) & 1 for k in range(m)]
+            for perm, flipbits in actions:
+                new_bits = [0] * m
+                for i in range(m):
+                    new_bits[perm[i]] = bits[i] ^ flipbits[i]
+                val = 0
+                for k, b in enumerate(new_bits):
+                    val |= b << k
+                if not visited[val]:
+                    visited[val] = True
+                    frontier.append(val)
+    return [tuple((r >> k) & 1 for k in range(m)) for r in reps]
+
+
+def orientations(G, coloring, auts=None):
     """Yield loop-valid orientations, one representative per pot-equivalence class.
 
     Loop rule: each color class must be bipartite; each connected component has
@@ -53,7 +126,16 @@ def orientations(G, coloring):
     star) -- has both directions equivalent: flipping the star is just the
     a<->a' relabel of that bond type, a non-distinction. So a saturated class is
     pinned (arrows point OUT of the center) and contributes x1, not x2. This
-    removes a factor of 2 per saturated class from the orientation count."""
+    removes a factor of 2 per saturated class from the orientation count.
+
+    If `auts` (automorphisms of G, e.g. from swapcolor.automorphisms) is given,
+    a further reduction applies: this coloring's STABILIZER within `auts` (the
+    automorphisms mapping its color-class partition onto itself) acts on the
+    free-component flip-vector space, and flip-vectors in the same orbit yield
+    orientations related by an actual automorphism of G -- so they succeed or
+    fail every later check identically and produce isomorphic pots. Only one
+    representative per orbit is yielded. Safe to omit (auts=None): falls back
+    to enumerating every flip combination, as before."""
     by_color = {}
     for e in G.edges():
         k = sc.ekey(*e); by_color.setdefault(coloring[k], []).append(k)
@@ -75,7 +157,18 @@ def orientations(G, coloring):
         for comp in nx.connected_components(Gc):
             sub = Gc.subgraph(comp)
             comps.append(([sc.ekey(u, v) for u, v in sub.edges()], side))
-    for flips in itertools.product((0, 1), repeat=len(comps)):
+
+    m = len(comps)
+    flip_tuples = None
+    if auts and m > 0:
+        stab = _coloring_stabilizer(G, coloring, auts)
+        if len(stab) > 1:                              # nontrivial: worth the BFS
+            actions = [_component_action(a, comps) for a in stab]
+            flip_tuples = _flip_orbits(m, actions)
+    if flip_tuples is None:
+        flip_tuples = list(itertools.product((0, 1), repeat=m))
+
+    for flips in flip_tuples:
         orient = dict(fixed)
         for (cedges, side), flip in zip(comps, flips):
             for (u, v) in cedges:
@@ -100,6 +193,40 @@ def multiedge_offenders(G, coloring, orient):
             if len({t1, h1, t2, h2}) < 4:
                 continue
             if frozenset((t1, h2)) in Eset or frozenset((t2, h1)) in Eset:
+                out.append((sc.ekey(t1, h1), sc.ekey(t2, h2)))
+    return out
+
+# ============================================================
+#  Stage 3b: precomputed non-isomorphism rule (cheap, no fresh iso check)
+# ============================================================
+
+def iso_offenders(G, coloring, orient, safe_switches):
+    """ALL nonadjacent same-type arrow pairs whose realized head-swap is a
+    CERTIFIED non-isomorphism, per the graph-level Delta/isomorphism analysis
+    (sc.complete_conflicts). A pair only ends up in safe_switches when it has
+    at least one non-isomorphic switch alongside its isomorphic one(s); an
+    orientation is doomed exactly when it realizes one of the unsafe switches
+    instead. This is a lookup against work already done once per graph -- no
+    fresh nx.is_isomorphic call -- so it lets stage 3 reject orientations that
+    would otherwise only be caught later (and much more expensively) by
+    validate_candidate. Pairs absent from safe_switches need no check here:
+    either every switch was Delta != 0 (forced apart, never same-colored) or
+    both possible reconnections multiedge -- already caught above."""
+    by_color = {}
+    for e in G.edges():
+        k = sc.ekey(*e); by_color.setdefault(coloring[k], []).append(orient[k])
+    out = []
+    for c, arcs in by_color.items():
+        for (t1, h1), (t2, h2) in itertools.combinations(arcs, 2):
+            if len({t1, h1, t2, h2}) < 4:
+                continue
+            pair = frozenset((sc.ekey(t1, h1), sc.ekey(t2, h2)))
+            safe = safe_switches.get(pair)
+            if safe is None:
+                continue
+            safe_edges = {frozenset((sc.ekey(v, t), sc.ekey(s, w))) for (v, w, s, t) in safe}
+            realized = frozenset((sc.ekey(t1, h2), sc.ekey(t2, h1)))
+            if realized not in safe_edges:
                 out.append((sc.ekey(t1, h1), sc.ekey(t2, h2)))
     return out
 
@@ -270,27 +397,30 @@ class _Progress:
             sys.stderr.write("\n"); sys.stderr.flush()
 
 
-def _analyze_colorings(G, colorings, show=False):
+def _analyze_colorings(G, colorings, safe_switches, auts=None, show=False):
     n = G.number_of_nodes()
-    jobs = [(coloring, list(orientations(G, coloring))) for coloring in colorings]
+    jobs = [(coloring, list(orientations(G, coloring, auts))) for coloring in colorings]
     prog = _Progress(sum(len(o) for _, o in jobs), "orientations") if show else None
     per = []
     for coloring, orients in jobs:
-        cands, mat_fails, me_fails = [], [], []
+        cands, mat_fails, me_fails, iso_fails = [], [], [], []
         for orient in orients:
             if prog:
                 prog.tick()
             offenders = multiedge_offenders(G, coloring, orient)      # ALL of them
             if offenders:
                 me_fails.append((orient, offenders)); continue
+            offenders = iso_offenders(G, coloring, orient, safe_switches)  # cheap, precomputed
+            if offenders:
+                iso_fails.append((orient, offenders)); continue
             Z, tiles, colors = build_pot_Z(G, coloring, orient)
             mp, sol, supp = min_realizable_size(Z, len(tiles), n)
             if mp == n:
                 cands.append((orient, Z, tiles, colors))
             else:
                 mat_fails.append((orient, Z, tiles, colors, mp, sol, supp))
-        per.append(dict(coloring=coloring, orients=orients,
-                        candidates=cands, matrix_fails=mat_fails, multiedge_fails=me_fails))
+        per.append(dict(coloring=coloring, orients=orients, candidates=cands,
+                        matrix_fails=mat_fails, multiedge_fails=me_fails, iso_fails=iso_fails))
     if prog:
         prog.close()
     return per
@@ -298,11 +428,12 @@ def _analyze_colorings(G, colorings, show=False):
 
 def analyze_graph(G):
     n = G.number_of_nodes()
-    k, colorings, Hstar = triangle_colorings(G)
+    k, colorings, Hstar, safe_switches, auts = triangle_colorings(G)
     print("analyzing orientations...")
-    per = _analyze_colorings(G, colorings, show=True)
+    per = _analyze_colorings(G, colorings, safe_switches, auts, show=True)
     ncand = sum(len(p["candidates"]) for p in per)
     return dict(n=n, k=k, colorings=colorings, per=per, Hstar=Hstar,
+                safe_switches=safe_switches, auts=auts,
                 proven=(k if ncand > 0 else k + 1), partial=False)
 
 # ============================================================
@@ -545,11 +676,13 @@ def _summary(label, A):
     k = A["k"]
     ncand = sum(len(p["candidates"]) for p in A["per"])
     nmefail = sum(len(p["multiedge_fails"]) for p in A["per"])
+    nisofail = sum(len(p.get("iso_fails", [])) for p in A["per"])
     nmatfail = sum(len(p["matrix_fails"]) for p in A["per"])
     print(f"\nB_3({label}) >= {k}.")
     print(f"  {len(A['colorings'])} minimum coloring(s) at k = {k} types.")
-    print(f"  candidate pots (passed loop + multiedge + m_P=n): {ncand}")
+    print(f"  candidate pots (passed loop + multiedge + iso + m_P=n): {ncand}")
     print(f"  orientations set aside by the multiedge rule:      {nmefail}")
+    print(f"  orientations set aside by the precomputed iso rule: {nisofail}")
     print(f"  orientations rejected by the construction matrix:  {nmatfail}")
     if ncand == 0:
         print(f"  -> no candidate at k = {k}; the coloring must grow, so B_3 >= {k+1}.")
@@ -669,7 +802,7 @@ def _validate(label, A, G, family_key, outdir):
     else:
         print(f"\nall candidates failed validation. B_3({label}) >= {A['k'] + 1}.")
 
-def _recolor(label, A, G, family_key, outdir, color_cap=200000):
+def _recolor(label, A, G, family_key, outdir, color_cap=1e6):
     """Advance one level, k -> k+1, by a COMPLETE enumeration of the proper
     (k+1)-colorings of the conflict graph (deduped under Aut(G)). A valid (k+1)
     coloring need NOT be a single-edge refinement of a k-coloring -- the prism is
@@ -677,15 +810,18 @@ def _recolor(label, A, G, family_key, outdir, color_cap=200000):
     candidate means B_3 could be k+1 (validate to confirm); an exhaustive
     enumeration with no candidate proves B_3 >= k+2. One level per call.
     Returns the advanced analysis dict, or None if declined."""
-    k = A["k"]; Hstar = A.get("Hstar")
-    if Hstar is None:
-        _, H0, amb = sc.analyze(G); Hstar, _ = sc.complete_conflicts(G, H0, amb)
+    k = A["k"]; Hstar = A.get("Hstar"); safe_switches = A.get("safe_switches")
+    auts = A.get("auts")
+    if Hstar is None or safe_switches is None:
+        _, H0, amb = sc.analyze(G); Hstar, _, safe_switches = sc.complete_conflicts(G, H0, amb)
+    if auts is None:
+        auts = sc.automorphisms(G, cap=20000)
     if not _confirm(f"enumerate ALL proper {k+1}-colorings and analyze them "
                     f"(exhaustive; proves B_3 >= {k+2} if none works)? can be slow"):
         return None
     parts = sc.enumerate_colorings(Hstar, k + 1, cap=color_cap)
     complete = len(parts) < color_cap
-    reps = sc.dedupe_under_aut(parts, sc.automorphisms(G, cap=20000)) if parts else []
+    reps = sc.dedupe_under_aut(parts, auts) if parts else []
     colorings = []
     for part in reps:
         cd = {}
@@ -695,7 +831,7 @@ def _recolor(label, A, G, family_key, outdir, color_cap=200000):
         if len(set(cd.values())) == k + 1:          # actually uses k+1 types
             colorings.append(cd)
     print(f"analyzing {len(colorings)} coloring(s) at k = {k+1}...")
-    per = _analyze_colorings(G, colorings, show=True)
+    per = _analyze_colorings(G, colorings, safe_switches, auts, show=True)
     ncand = sum(len(q["candidates"]) for q in per)
     if ncand > 0:
         proven = k + 1
@@ -708,6 +844,7 @@ def _recolor(label, A, G, family_key, outdir, color_cap=200000):
         print(f"k = {k+1}: no candidate, but enumeration hit the cap ({color_cap}); "
               "NOT proven -- raise the cap to certify.")
     return dict(n=A["n"], k=k + 1, colorings=colorings, per=per, Hstar=Hstar,
+                safe_switches=safe_switches, auts=auts,
                 proven=proven, partial=(not complete and ncand == 0))
 
 

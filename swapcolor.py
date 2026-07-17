@@ -73,21 +73,28 @@ def switch(G, v, w, s, t):
 
 def analyze(G):
     """Cheap pass. Returns (targets, H, ambiguous).
-    H: conflict graph on E(G); edge iff some target has Delta != 0 (certified
-       distinct bond-edge types).
+    H: conflict graph on E(G); edge iff EVERY switch of that pair is certified
+       (or later confirmed) non-isomorphic -- a pair has up to two distinct
+       2-switches, and the edges are forced apart only if BOTH are non-iso.
+       One non-iso witness alone is NOT sufficient: if the other switch is
+       isomorphic, that pair may still share a bond type via that reconnection.
     ambiguous: {frozenset({e1,e2}): [ (v,w,s,t), ... ]} listing EVERY Delta==0
-       reconnection of the pair (a pair has up to two distinct 2-switches;
-       both must be tested -- the triangle test is silent on each)."""
+       reconnection of a pair that has at least one Delta==0 switch (a pair with
+       all switches Delta!=0 is decided immediately; nothing left to check)."""
     H = nx.Graph(); H.add_nodes_from(ekey(*e) for e in G.edges())
-    ambiguous = {}
+    pair_switches = {}
     targets = 0
     for v, w, s, t, delta in alternating_4cycles(G):
         targets += 1
         e1, e2 = ekey(v, w), ekey(s, t)
-        if delta != 0:
-            H.add_edge(e1, e2)
+        pair_switches.setdefault(frozenset((e1, e2)), []).append((v, w, s, t, delta))
+    ambiguous = {}
+    for pair, switches in pair_switches.items():
+        zero = [(v, w, s, t) for (v, w, s, t, delta) in switches if delta == 0]
+        if zero:
+            ambiguous[pair] = zero        # need iso check before deciding this pair
         else:
-            ambiguous.setdefault(frozenset((e1, e2)), []).append((v, w, s, t))
+            H.add_edge(*tuple(pair))      # every switch already Delta != 0: forced
     return targets, H, ambiguous
 
 # ============================================================
@@ -144,9 +151,11 @@ def _color_map(part):
 
 def lazy_refine(G, H, ambiguous):
     """Color H; for each Delta==0 pair placed in the SAME color class, run the
-    brute-force switch test. Non-iso -> real conflict, add to H and recolor.
-    Iso -> genuine free swap, allowed to share. Repeat to fixpoint.
-    At fixpoint chi(H) == chi(H*) (true bond-edge number). Returns stats."""
+    brute-force switch test on EVERY reconnection of that pair (not just the
+    first) -- forced conflict requires ALL of a pair's switches to be non-iso;
+    if even one is isomorphic, the pair is a genuine free swap via that
+    reconnection. Repeat to fixpoint. At fixpoint chi(H) == chi(H*) (true
+    bond-edge number). Returns stats."""
     resolved = set(); checks = 0; added = 0
     while True:
         k, part = min_coloring(H); color = _color_map(part)
@@ -155,35 +164,40 @@ def lazy_refine(G, H, ambiguous):
             if pair in resolved: continue
             e1, e2 = tuple(pair)
             if color[e1] == color[e2]:
-                conflict = False
+                iso_flags = []
                 for (v, w, s, t) in switches:          # test every reconnection
                     checks += 1
-                    if not nx.is_isomorphic(G, switch(G, v, w, s, t)):
-                        conflict = True; break          # one non-iso => must differ
-                if conflict:
+                    iso_flags.append(nx.is_isomorphic(G, switch(G, v, w, s, t)))
+                if not any(iso_flags):                 # all non-iso => must differ
                     H.add_edge(e1, e2); added += 1
                     changed = True
                 else:
-                    resolved.add(pair)                 # all reconnections iso: free
+                    resolved.add(pair)                 # at least one iso: free
         if not changed:
             return dict(chi=k, coloring=part, checks=checks,
                         free_swaps=len(resolved), new_conflicts=added)
 
 def complete_conflicts(G, H, ambiguous):
     """Resolve EVERY ambiguous pair by brute force -> true conflict graph H*.
-    Needed to enumerate ALL minimum colorings correctly. Returns (H*, stats)."""
+    A pair is forced apart only if ALL of its switches are non-isomorphic;
+    if any switch is isomorphic, the pair is free via that specific
+    reconnection. Needed to enumerate ALL minimum colorings correctly.
+    Returns (H*, stats, safe_switches): safe_switches maps each FREE pair to
+    the list of its isomorphic (v,w,s,t) reconnections -- the only ones an
+    orientation may realize if the pair ends up same-colored."""
     H2 = H.copy(); free = added = checks = 0
+    safe_switches = {}
     for pair, switches in ambiguous.items():
-        conflict = False
+        results = []
         for (v, w, s, t) in switches:
             checks += 1
-            if not nx.is_isomorphic(G, switch(G, v, w, s, t)):
-                conflict = True; break
-        if conflict:
+            results.append(((v, w, s, t), nx.is_isomorphic(G, switch(G, v, w, s, t))))
+        if not any(iso for _, iso in results):
             H2.add_edge(*tuple(pair)); added += 1
         else:
             free += 1
-    return H2, dict(checks=checks, free_swaps=free, new_conflicts=added)
+            safe_switches[pair] = [sw for sw, iso in results if iso]
+    return H2, dict(checks=checks, free_swaps=free, new_conflicts=added), safe_switches
 
 # ============================================================
 #  Automorphism dedupe
@@ -272,7 +286,7 @@ def report(key, G, n, quiet=False):
         return dict(targets=targets, verdict=verdict, beta=st["chi"],
                     n_zero=len(ambiguous), checks=st["checks"],
                     free=st["free_swaps"], reps=None, conflicts=H.number_of_edges())
-    Hstar, st = complete_conflicts(G, H, ambiguous)         # full resolution
+    Hstar, st, _ = complete_conflicts(G, H, ambiguous)      # full resolution
     beta, colorings = chromatic_and_colorings(Hstar)
     reps = dedupe_under_aut(colorings, automorphisms(G)) if colorings else []
     if not ambiguous:
