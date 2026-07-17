@@ -688,7 +688,7 @@ def _summary(label, A):
         print(f"  -> no candidate at k = {k}; the coloring must grow, so B_3 >= {k+1}.")
     else:
         print(f"  -> {ncand} candidate(s) exist; validate (menu 6) to confirm B_3 = {k}.")
-
+ 
 def _viz_multiedge_fails(A, G, family_key, outdir):
     # one before/after per (orientation, offending swap)
     jobs = [(ci, orient, off) for ci, p in enumerate(A["per"], 1)
@@ -760,7 +760,7 @@ def _dump_matrix_fails(A, outdir, label, G):
                 f.write("orientation: " + arcs + "\n")
                 f.write(matrix_text(Z, tiles, colors, mp, n, sol, supp) + "\n\n")
     print(f"{total} failing construction matrix/matrices written to {path}.")
-
+# ha
 def _list_candidates(A, G):
     tot = 0
     for ci, p in enumerate(A["per"], 1):
