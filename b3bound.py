@@ -354,7 +354,89 @@ def min_realizable_size(Z, p, n_cap):
 #  Stage 5: isomorphism validation (opt-in)
 # ============================================================
 
-def validate_candidate(G, coloring, orient):
+def _wl(H):
+    """Weisfeiler-Lehman hash, warning silenced (we only ever compare hashes
+    computed within a single run/version, so the v3.5 reproducibility note is
+    irrelevant here)."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return nx.weisfeiler_lehman_graph_hash(H)
+
+def _all_null_vectors(Z, n):
+    """Every nonnegative integer tile-count vector R (len = #tiles) with
+    sum R = n and Z R = 0 -- i.e. every way the pot assembles a complete complex
+    of order n. (min_realizable_size finds only the first; a valid Scenario-3
+    pot must have this be unique up to the pairings below giving only G.)"""
+    p = len(Z[0]); nrows = len(Z); sols = []; counts = [0] * p
+
+    def rec(j, remaining, partial):
+        if j == p:
+            if remaining == 0 and all(x == 0 for x in partial):
+                sols.append(tuple(counts))
+            return
+        for v in range(remaining + 1):
+            counts[j] = v
+            rec(j + 1, remaining - v, [partial[i] + Z[i][j] * v for i in range(nrows)])
+        counts[j] = 0
+
+    rec(0, n, [0] * nrows)
+    return sols
+
+def _distinct_matchings(tails, heads):
+    """Distinct ways to bond one bond type's unhatted ends (`tails`, tile-instance
+    ids with multiplicity) to its hatted ends (`heads`). Two matchings that only
+    permute ends on the SAME tile give the same complex, so identical tails are
+    forced to take non-decreasing heads -- that dedup keeps stars from blowing up
+    to k! copies of one graph."""
+    tails = sorted(tails)
+
+    def rec(i, remaining, acc):
+        if i == len(tails):
+            yield tuple(acc); return
+        t = tails[i]
+        lo = acc[-1][1] if (i > 0 and tails[i - 1] == t) else None
+        for h in sorted(set(remaining)):
+            if lo is not None and h < lo:
+                continue
+            rem = list(remaining); rem.remove(h)
+            yield from rec(i + 1, rem, acc + [(t, h)])
+
+    yield from rec(0, list(heads), [])
+
+def _pot_complexes(tiles, colors, R):
+    """Every complete complex the pot assembles from the tile multiset R: the
+    product over bond types of that type's distinct end-pairings. Yields
+    nx.MultiGraph on the tile instances (loops/parallel edges may appear)."""
+    inst = []
+    for sig, cnt in zip(tiles, R):
+        inst.extend([sig] * cnt)
+    tails = {c: [] for c in colors}; heads = {c: [] for c in colors}
+    for idx, sig in enumerate(inst):
+        for (c, s) in sig:
+            (tails if s > 0 else heads)[c].append(idx)
+    per_color = [list(_distinct_matchings(tails[c], heads[c])) for c in colors]
+    for combo in itertools.product(*per_color):
+        M = nx.MultiGraph(); M.add_nodes_from(range(len(inst)))
+        for cm in combo:
+            for (t, h) in cm:
+                M.add_edge(t, h)
+        yield M
+
+def validate_candidate(G, coloring, orient, cap=500000):
+    """Complete Scenario-3 certificate for one candidate pot: EVERY complex it can
+    assemble at order n = |V(G)| is isomorphic to G, so {G} = C_min(P) (given the
+    caller already has m_P = n). This is stronger than the old swap-only test: a
+    pot can have m_P = n and pass every single 2-switch yet still build a
+    non-isomorphic order-n complex from a DIFFERENT tile-count mix (e.g. a second
+    integer null vector of the construction matrix). We therefore enumerate all
+    tile-count vectors and all end-pairings.
+
+    Returns True (certified), False (a non-isomorphic / looped / multi-edged
+    complex exists), or None (enumeration passed `cap` complexes undecided --
+    treat as unverified, not as pass)."""
+    # Fast necessary pre-filter: G's own realization must be swap-stable (Lemma 4).
+    # A failing single 2-switch is already a non-isomorphic order-n complex.
     by_color = {}
     for e in G.edges():
         k = sc.ekey(*e); by_color.setdefault(coloring[k], []).append(orient[k])
@@ -366,6 +448,26 @@ def validate_candidate(G, coloring, orient):
             H.add_edge(t1, h2); H.add_edge(t2, h1)
             if not nx.is_isomorphic(G, H):
                 return False
+
+    # Complete check: every order-n complex the pot can build must be iso to G.
+    n = G.number_of_nodes()
+    Z, tiles, colors = build_pot_Z(G, coloring, orient)
+    ghash = _wl(G)
+    seen = 0
+    for R in _all_null_vectors(Z, n):
+        for M in _pot_complexes(tiles, colors, R):
+            seen += 1
+            if seen > cap:
+                return None
+            if any(u == v for u, v in M.edges()):
+                return False                                   # loop -> not iso to loopless G
+            S = nx.Graph(M)
+            if S.number_of_edges() != M.number_of_edges():
+                return False                                   # multiedge
+            if _wl(S) != ghash:
+                return False                                   # cheap certificate mismatch
+            if not nx.is_isomorphic(G, S):
+                return False                                   # WL-collision guard
     return True
 
 # ============================================================
@@ -780,28 +882,39 @@ def _validate(label, A, G, family_key, outdir):
     if not _confirm(f"validate {len(cands)} candidate(s) with isomorphism checks? "
                     "this can be expensive"):
         return
-    found = 0
+    found = 0; rejected = 0; undecided = 0
     prog = _Progress(len(cands), "validating")
     for ci, orient in cands:
         prog.tick()
         coloring = A["per"][ci - 1]["coloring"]
-        if validate_candidate(G, coloring, orient):
-            found += 1
-            setf, arcs = pot_text(G, coloring, orient)
-            txt = os.path.join(outdir, f"optimal_tiling_{found}.txt")
-            with open(txt, "w") as f:
-                f.write(f"OPTIMAL TILING for {label}\n\n{setf}\n\noriented edges:\n" +
-                        "\n".join(f"{t} -{L}-> {h}" for t, h, L in sorted(arcs)) + "\n")
-            png = os.path.join(outdir, f"optimal_tiling_{found}.png")
-            render_orientation(G, coloring, orient, png, family_key,
-                               f"optimal tiling {found}: {label}")
-            print(f"\n  OPTIMAL TILING {found}:  {setf}")
-            print(f"    wrote {txt} , {png}")
+        res = validate_candidate(G, coloring, orient)
+        if res is None:
+            undecided += 1; continue
+        if res is False:
+            rejected += 1; continue                # builds a non-iso same-order complex
+        found += 1
+        setf, arcs = pot_text(G, coloring, orient)
+        txt = os.path.join(outdir, f"optimal_tiling_{found}.txt")
+        with open(txt, "w") as f:
+            f.write(f"OPTIMAL TILING for {label}\n\n{setf}\n\noriented edges:\n" +
+                    "\n".join(f"{t} -{L}-> {h}" for t, h, L in sorted(arcs)) + "\n")
+        png = os.path.join(outdir, f"optimal_tiling_{found}.png")
+        render_orientation(G, coloring, orient, png, family_key,
+                           f"optimal tiling {found}: {label}")
+        print(f"\n  OPTIMAL TILING {found}:  {setf}")
+        print(f"    wrote {txt} , {png}")
     prog.close()
+    if rejected:
+        print(f"\n{rejected} candidate(s) rejected: they build a non-isomorphic complex "
+              "of the same order (m_P = n is necessary but NOT sufficient for Scenario 3).")
+    if undecided:
+        print(f"{undecided} candidate(s) undecided (enumeration exceeded the cap).")
     if found:
-        print(f"\n{found} optimal tiling(s) found. B_3({label}) = {A['k']} achieved.")
+        print(f"\n{found} optimal tiling(s) certified. B_3({label}) = {A['k']} achieved.")
+    elif undecided and not rejected:
+        print(f"\nno candidate certified within the cap; result inconclusive.")
     else:
-        print(f"\nall candidates failed validation. B_3({label}) >= {A['k'] + 1}.")
+        print(f"\nall candidates rejected. B_3({label}) >= {A['k'] + 1}.")
 
 def _recolor(label, A, G, family_key, outdir, color_cap=1e6):
     """Advance one level, k -> k+1, by a COMPLETE enumeration of the proper
