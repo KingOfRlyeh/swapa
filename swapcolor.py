@@ -31,6 +31,34 @@ def web_graph(n):
         G.add_edge(i, n+i);       G.add_edge(n+i, 2*n+i)
     return G
 
+def kayak_paddle_graph(c1, c2=None, l=1):
+    """Kayak paddle, tuples read as cycle-cycle-path: a C_c1 blade, a C_c2
+    blade, joined by a shaft path of length l. So kayak(3,4,2) is C_3 and C_4
+    joined by a 2-edge path. Nodes: blade A = 0..c1-1, blade B = c1..c1+c2-1,
+    and l-1 internal shaft vertices c1+c2..c1+c2+l-2 (c1+c2+l-1 verts,
+    c1+c2+l edges). Defaults c2=c1, l=1 (single bridge edge)."""
+    if c2 is None:
+        c2 = c1
+    G = nx.cycle_graph(c1)                                       # blade A: 0..c1-1
+    G.add_edges_from((c1+i, c1+(i+1) % c2) for i in range(c2))   # blade B: c1..c1+c2-1
+    prev = 0                                                     # shaft: attach at A-vertex 0
+    for j in range(l - 1):                                       # ... through internal verts
+        v = c1 + c2 + j
+        G.add_edge(prev, v); prev = v
+    G.add_edge(prev, c1)                                         # ... to B-vertex c1
+    return G
+
+def kayak_params(t):
+    """Normalize a kayak tuple to (c1, c2, l) in cycle-cycle-path order.
+    (n,) -> (n,n,1) [bridge]; (a,b) -> (a,b,1) [two cycles, bridge]."""
+    t = tuple(t)
+    if len(t) == 1: return (t[0], t[0], 1)
+    if len(t) == 2: return (t[0], t[1], 1)
+    return (t[0], t[1], t[2])
+
+# Families whose members are picked by tuple parameters, not a single index n.
+TUPLE_FAMILIES = {"kayak"}
+
 FAMILY_GENS = {
     "cycle":           (nx.cycle_graph,           "C_n  (n verts)",      3),
     "complete":        (nx.complete_graph,        "K_n  (n verts)",      1),
@@ -41,6 +69,7 @@ FAMILY_GENS = {
     "circular_ladder": (nx.circular_ladder_graph, "CL_n (2n verts)",     3),
     "star":            (nx.star_graph,            "S_n  (n+1 verts)",    1),
     "web":             (web_graph,                "CL_n + pendants (3n)",3),
+    "kayak":           (kayak_paddle_graph,       "cycle-cycle-path, tuples (c1,c2,l)", 3),
 }
 
 # ============================================================
@@ -249,6 +278,15 @@ def canonical_layout(key, G, n):
         pos.update(_ring(list(range(2*n, 3*n)), 2.6)); return pos
     if key == "ladder":
         return {**{i: (i, 0.0) for i in range(n)}, **{n+i: (i, 1.0) for i in range(n)}}
+    if key == "kayak":
+        if not isinstance(n, (tuple, list)):
+            return nx.kamada_kawai_layout(G)          # scalar caller: no params to place
+        c1, c2, l = kayak_params(n)
+        pos = {v: (x - 2.4, y) for v, (x, y) in _ring(list(range(c1)), 1.0).items()}
+        pos.update({v: (x + 2.4, y) for v, (x, y) in _ring(list(range(c1, c1+c2)), 1.0).items()})
+        for j in range(l - 1):                        # shaft verts strung between blades
+            pos[c1 + c2 + j] = (-1.4 + (j + 1) * 2.8 / l, 0.0)
+        return pos
     return nx.kamada_kawai_layout(G)
 
 PALETTE = plt.cm.tab10.colors
@@ -313,6 +351,32 @@ def parse_range(s):
     if len(p) == 2: return range(int(p[0]), int(p[1]) + 1)
     return range(int(p[0]), int(p[1]) + 1, int(p[2]))
 
+def parse_tuples(s):
+    """Parse whitespace-separated tuples like '(3,3,1) (4,5,2)'. A bare
+    '3,3,1' with no parentheses is accepted as one tuple. Returns int tuples."""
+    import re
+    groups = re.findall(r"\(([^)]*)\)", s)
+    if not groups and s.strip():
+        groups = [s]
+    out = []
+    for g in groups:
+        vals = [int(x) for x in g.replace(",", " ").split()]
+        if vals:
+            out.append(tuple(vals))
+    return out
+
+def kayak_valid_params(raw_tuples, minn):
+    """Normalize raw kayak tuples to (c1, l, c2), warning on and dropping any
+    out of range (a cycle below minn, or a path length below 1)."""
+    out = []
+    for t in raw_tuples:
+        p = kayak_params(t)                       # (c1, c2, l)
+        if p[0] >= minn and p[1] >= minn and p[2] >= 1:
+            out.append(p)
+        else:
+            print(f"  skipping {p}: need cycles c1,c2 >= {minn} and path l >= 1")
+    return out
+
 def parse_custom_graph(s):
     G = nx.Graph()
     for tok in s.replace(",", " ").split():
@@ -334,30 +398,38 @@ def main():
         key = names[int(sel) - 1] if sel.isdigit() and 1 <= int(sel) <= len(names) else sel
         if key not in FAMILY_GENS: print("unknown family."); return
         gen, desc, minn = FAMILY_GENS[key]
-        rng = parse_range(ask(f"n range for '{key}' (min {minn}) -- 'start end [step]': "))
-        items = [(n, gen(n)) for n in rng if n >= minn]
+        if key in TUPLE_FAMILIES:
+            raw = parse_tuples(ask(f"parameters for '{key}' as tuples "
+                                   f"(cycle,cycle,path), e.g. (3,4,2)  [min cycle {minn}]: "))
+            items = [(p, gen(*p)) for p in kayak_valid_params(raw, minn)]
+        else:
+            rng = parse_range(ask(f"n range for '{key}' (min {minn}) -- 'start end [step]': "))
+            items = [(n, gen(n)) for n in rng if n >= minn]
         print(f"\n{key}: {desc}")
+
+    if not items:
+        print("no valid graphs to analyze."); return
 
     quiet = ask("suppress graph output, bond-edge number only? [y/N] ").lower() in ("y", "yes")
 
     if quiet:
-        print(f"\n{'n':>4}{'verdict':>14}{'beta':>6}{'Δ=0':>6}{'checks':>8}")
-        print("-" * 38)
+        print(f"\n{'n':>9}{'verdict':>14}{'beta':>6}{'Δ=0':>6}{'checks':>8}")
+        print("-" * 43)
         for n, G in items:
             r = report(key, G, n, quiet=True)
-            print(f"{n:>4}{r['verdict']:>14}{r['beta']:>6}{r['n_zero']:>6}{r['checks']:>8}")
+            print(f"{str(n):>9}{r['verdict']:>14}{r['beta']:>6}{r['n_zero']:>6}{r['checks']:>8}")
         print("\nbeta = bond-edge number chi(H*), refined by brute-forcing only the"
               "\nDelta==0 pairs that a minimum coloring places in one class."
               "\nunswappable* = beta certified but no free swap surfaced (lazy).")
         return
 
-    print(f"\n{'n':>4}{'verts':>7}{'edges':>7}{'targets':>9}{'Δ=0':>6}"
+    print(f"\n{'n':>9}{'verts':>7}{'edges':>7}{'targets':>9}{'Δ=0':>6}"
           f"{'checks':>8}{'conflicts':>11}{'verdict':>13}{'beta':>6}{'#col':>7}")
-    print("-" * 80)
+    print("-" * 85)
     results = {}
     for n, G in items:
         r = report(key, G, n); results[n] = (G, r)
-        print(f"{n:>4}{G.number_of_nodes():>7}{G.number_of_edges():>7}{r['targets']:>9}"
+        print(f"{str(n):>9}{G.number_of_nodes():>7}{G.number_of_edges():>7}{r['targets']:>9}"
               f"{r['n_zero']:>6}{r['checks']:>8}{r['conflicts']:>11}{r['verdict']:>13}"
               f"{r['beta']:>6}{len(r['reps']):>7}")
     print("\nΔ=0: targets the triangle test could not decide."
@@ -365,10 +437,16 @@ def main():
           "\nconflicts: edges of the true conflict graph H* (Δ!=0 plus Δ=0-non-iso)."
           "\nbeta = chi(H*); #col = minimum colorings up to relabeling and Aut(G).")
 
+    prompt = ("\nplot colorings for (k,m,l) = ? (blank to quit): " if key in TUPLE_FAMILIES
+              else "\nplot colorings for n = ? (blank to quit): ")
     while True:
-        s = ask("\nplot colorings for n = ? (blank to quit): ")
+        s = ask(prompt)
         if not s: break
-        n = int(s)
+        if key in TUPLE_FAMILIES:
+            tp = parse_tuples(s)
+            n = kayak_params(tp[0]) if tp else None
+        else:
+            n = int(s)
         if n not in results: print("not computed."); continue
         G, r = results[n]
         if not r["reps"]: print("no colorings to plot."); continue

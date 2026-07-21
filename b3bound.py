@@ -453,6 +453,7 @@ def _pal():
 def _layout(G, family_key):
     n = G.number_of_nodes()
     if family_key in sc.FAMILY_GENS:
+        # kayak is tuple-parameterized, not derivable from vertex count -> kamada
         fam_n = {"cycle": n, "complete": n, "star": n - 1, "mobius": n // 2,
                  "sunlet": n // 2, "sun": n // 2, "circular_ladder": n // 2,
                  "ladder": n // 2, "web": n // 3}.get(family_key, n)
@@ -900,9 +901,15 @@ def main():
     elif args.family:
         family_key = args.family
         gen, desc, minn = sc.FAMILY_GENS[args.family]
-        rng = _parse_range(" ".join(map(str, args.range))) if args.range \
-            else range(minn, minn + 1)
-        items = [(f"{args.family}({n})", gen(n)) for n in rng if n >= minn]
+        if args.family in sc.TUPLE_FAMILIES:
+            vals = args.range or [minn, minn, 1]
+            raw = [tuple(vals[i:i+3]) for i in range(0, len(vals), 3)]
+            items = [(f"{args.family}({p[0]}-{p[1]}-{p[2]})", gen(*p))
+                     for p in sc.kayak_valid_params(raw, minn)]
+        else:
+            rng = _parse_range(" ".join(map(str, args.range))) if args.range \
+                else range(minn, minn + 1)
+            items = [(f"{args.family}({n})", gen(n)) for n in rng if n >= minn]
     else:
         print("families (n = symmetry index):")
         for i, nm in enumerate(fams, 1):
@@ -916,8 +923,17 @@ def main():
             if key not in sc.FAMILY_GENS: print("unknown family."); return
             family_key = key
             gen, desc, minn = sc.FAMILY_GENS[key]
-            rng = _parse_range(_ask(f"n range for '{key}' (min {minn}): "))
-            items = [(f"{key}({n})", gen(n)) for n in rng if n >= minn]
+            if key in sc.TUPLE_FAMILIES:
+                raw = sc.parse_tuples(_ask(f"parameters for '{key}' as tuples "
+                                           f"(cycle,cycle,path), e.g. (3,4,2)  [min cycle {minn}]: "))
+                items = [(f"{key}({p[0]}-{p[1]}-{p[2]})", gen(*p))
+                         for p in sc.kayak_valid_params(raw, minn)]
+            else:
+                rng = _parse_range(_ask(f"n range for '{key}' (min {minn}): "))
+                items = [(f"{key}({n})", gen(n)) for n in rng if n >= minn]
+
+    if not items:
+        print("no valid graphs to analyze."); return
 
     for label, G in items:
         explore(label, G, family_key)

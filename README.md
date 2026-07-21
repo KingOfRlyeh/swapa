@@ -31,7 +31,8 @@ lower bound:  B_3 >= k bond-edge types
   4. dump failing construction matrices       -> failing_construction_matrices.txt
   5. list candidate pots
   6. validate candidates  (isomorphism -- slow, asks first)
-  7. try next color up    (exhausts the recolor pile -- slow, asks first)
+  7. try next color up    (full (k+1) enumeration -- slow, asks first)
+  8. visualize edge-swap (multiedge) failures -> edgeswap_*.png, edge_swaps.txt
   0. done
 ```
 
@@ -45,21 +46,26 @@ All output for a graph goes to a folder `b3_<label>/`.
   rejects (they realize a *smaller* complex, m_P < n). The file lists the
   orientation, the tile types, the Z matrix, and m_P. Useful raw data; there can
   be many, hence a file.
-- **candidates** — orientations that pass loop + multiedge + m_P = n. Not yet
-  proven optimal.
+- **candidates** — orientations that pass loop + multiedge + the precomputed
+  non-isomorphism rule + m_P = n. Not yet proven optimal.
 - **validate** — for each candidate, every allowed same-type arrow swap must
   keep the graph isomorphic to G. Survivors are **optimal tilings**, written as
   `optimal_tiling_*.txt` (pot set form + oriented edges) and `.png`. This is the
   only isomorphism-heavy step; it asks before running.
-- **next color up** — if there are no candidates (or none validate), this digs
-  through the whole set-aside pile, recolors each failing edge to a fresh color
-  (k+1), and re-runs. Also asks first.
+- **next color up** — if there are no candidates (or none validate), this
+  advances one level, k → k+1, by *completely* enumerating the proper
+  (k+1)-colorings of H\*, deduped under Aut(G), and re-running the pipeline on
+  each. A valid (k+1)-coloring need not be a one-edge refinement of a
+  k-coloring — the prism is a counterexample — so nothing less than the full
+  enumeration is sound. One level per call. Also asks first.
 
 ## Reading the bound
 
 The number is a **lower bound** (looseness is fine). No candidates at k proves
-B₃ ≥ k+1. A failed recolor round doesn't prove more than that — it only tries
-one-edge recolorings; the systematic k-loop is future work.
+B₃ ≥ k+1. If the (k+1) round is exhaustive and turns up no candidate either,
+that proves B₃ ≥ k+2 — but only when the enumeration ran to completion. If it
+hits the coloring cap (10⁶) the run says so and the stronger bound is *not*
+proven; raise the cap to certify it.
 
 ## Requirements
 
