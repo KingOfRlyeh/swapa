@@ -423,20 +423,22 @@ def _pot_complexes(tiles, colors, R):
                 M.add_edge(t, h)
         yield M
 
-def validate_candidate(G, coloring, orient, cap=500000):
-    """Complete Scenario-3 certificate for one candidate pot: EVERY complex it can
-    assemble at order n = |V(G)| is isomorphic to G, so {G} = C_min(P) (given the
-    caller already has m_P = n). This is stronger than the old swap-only test: a
-    pot can have m_P = n and pass every single 2-switch yet still build a
-    non-isomorphic order-n complex from a DIFFERENT tile-count mix (e.g. a second
-    integer null vector of the construction matrix). We therefore enumerate all
-    tile-count vectors and all end-pairings.
+def scenario3_check(G, coloring, orient, cap=500000):
+    """Complete Scenario-3 test for one candidate pot, returning (verdict, witness).
 
-    Returns True (certified), False (a non-isomorphic / looped / multi-edged
-    complex exists), or None (enumeration passed `cap` complexes undecided --
-    treat as unverified, not as pass)."""
+    verdict is True (certified: EVERY complex the pot builds at order n = |V(G)| is
+    isomorphic to G, so {G} = C_min(P) given m_P = n), False (a same-order complex
+    NOT isomorphic to G exists), or None (enumeration passed `cap` undecided). This
+    is stronger than the old swap-only test: a pot can have m_P = n and pass every
+    single 2-switch yet still build a non-isomorphic order-n complex from a
+    DIFFERENT tile-count mix (a second integer null vector of Z). We therefore
+    enumerate all tile-count vectors and all end-pairings.
+
+    witness is that offending complex when verdict is False -- an nx.Graph, or an
+    nx.MultiGraph if it carries a loop or parallel edge -- else None. It is a real
+    graph the pot assembles on n vertices, ready to draw beside G."""
     # Fast necessary pre-filter: G's own realization must be swap-stable (Lemma 4).
-    # A failing single 2-switch is already a non-isomorphic order-n complex.
+    # A failing single 2-switch is itself a non-isomorphic order-n complex.
     by_color = {}
     for e in G.edges():
         k = sc.ekey(*e); by_color.setdefault(coloring[k], []).append(orient[k])
@@ -447,7 +449,7 @@ def validate_candidate(G, coloring, orient, cap=500000):
             H.remove_edge(t1, h1); H.remove_edge(t2, h2)
             H.add_edge(t1, h2); H.add_edge(t2, h1)
             if not nx.is_isomorphic(G, H):
-                return False
+                return False, H
 
     # Complete check: every order-n complex the pot can build must be iso to G.
     n = G.number_of_nodes()
@@ -458,17 +460,21 @@ def validate_candidate(G, coloring, orient, cap=500000):
         for M in _pot_complexes(tiles, colors, R):
             seen += 1
             if seen > cap:
-                return None
+                return None, None
             if any(u == v for u, v in M.edges()):
-                return False                                   # loop -> not iso to loopless G
+                return False, M                                # loop -> not iso to loopless G
             S = nx.Graph(M)
             if S.number_of_edges() != M.number_of_edges():
-                return False                                   # multiedge
+                return False, M                                # multiedge
             if _wl(S) != ghash:
-                return False                                   # cheap certificate mismatch
+                return False, S                                # cheap certificate mismatch
             if not nx.is_isomorphic(G, S):
-                return False                                   # WL-collision guard
-    return True
+                return False, S                                # WL-collision guard
+    return True, None
+
+def validate_candidate(G, coloring, orient, cap=500000):
+    """Just the verdict (True/False/None) of scenario3_check; see it for details."""
+    return scenario3_check(G, coloring, orient, cap)[0]
 
 # ============================================================
 #  Full analysis of one graph (stages 1-4, cached)
@@ -499,40 +505,67 @@ class _Progress:
             sys.stderr.write("\n"); sys.stderr.flush()
 
 
-def _analyze_colorings(G, colorings, safe_switches, auts=None, show=False):
+def default_settings():
+    """Runtime toggles for one explore() session (see the 's' settings menu).
+      verbosity     0 quiet / 1 normal / 2 verbose  (gates prints + progress)
+      retain_fails  keep rejected-orientation DETAILS for the viz menus (4 & 8);
+                    off by default -- storing every failure is the pipeline's
+                    biggest avoidable memory cost. Counts are always kept.
+      progress      show progress bars
+      validate_cap  scenario3_check enumeration cap"""
+    return {"verbosity": 1, "retain_fails": False, "progress": True,
+            "validate_cap": 500000}
+
+
+def _analyze_colorings(G, colorings, safe_switches, auts=None, settings=None):
+    """Stream every orientation of every coloring through the gates, ONE at a
+    time -- no list of all orientations is ever materialized (that product,
+    #colorings x 2^(free components), was the dominant memory cost). Candidates
+    are always kept; rejected orientations are only counted unless
+    settings['retain_fails'] asks to keep their details for visualization."""
+    settings = settings or default_settings()
+    keep = settings["retain_fails"]
+    show = settings["progress"] and settings["verbosity"] >= 1
     n = G.number_of_nodes()
-    jobs = [(coloring, list(orientations(G, coloring, auts))) for coloring in colorings]
-    prog = _Progress(sum(len(o) for _, o in jobs), "orientations") if show else None
+    prog = _Progress(len(colorings), "colorings") if show else None
     per = []
-    for coloring, orients in jobs:
-        cands, mat_fails, me_fails, iso_fails = [], [], [], []
-        for orient in orients:
-            if prog:
-                prog.tick()
-            offenders = multiedge_offenders(G, coloring, orient)      # ALL of them
+    for coloring in colorings:
+        if prog:
+            prog.tick()
+        cands = []; mat_fails = []; me_fails = []; iso_fails = []
+        nmf = nme = niso = 0
+        for orient in orientations(G, coloring, auts):            # lazy: one dict live
+            offenders = multiedge_offenders(G, coloring, orient)
             if offenders:
-                me_fails.append((orient, offenders)); continue
-            offenders = iso_offenders(G, coloring, orient, safe_switches)  # cheap, precomputed
+                nme += 1
+                if keep: me_fails.append((orient, offenders))
+                continue
+            offenders = iso_offenders(G, coloring, orient, safe_switches)
             if offenders:
-                iso_fails.append((orient, offenders)); continue
+                niso += 1
+                if keep: iso_fails.append((orient, offenders))
+                continue
             Z, tiles, colors = build_pot_Z(G, coloring, orient)
             mp, sol, supp = min_realizable_size(Z, len(tiles), n)
             if mp == n:
                 cands.append((orient, Z, tiles, colors))
             else:
-                mat_fails.append((orient, Z, tiles, colors, mp, sol, supp))
-        per.append(dict(coloring=coloring, orients=orients, candidates=cands,
-                        matrix_fails=mat_fails, multiedge_fails=me_fails, iso_fails=iso_fails))
+                nmf += 1
+                if keep: mat_fails.append((orient, Z, tiles, colors, mp, sol, supp))
+        per.append(dict(coloring=coloring, candidates=cands,
+                        matrix_fails=mat_fails, multiedge_fails=me_fails, iso_fails=iso_fails,
+                        n_matrix_fails=nmf, n_multiedge_fails=nme, n_iso_fails=niso))
     if prog:
         prog.close()
     return per
 
 
-def analyze_graph(G):
+def analyze_graph(G, settings=None):
     n = G.number_of_nodes()
     k, colorings, Hstar, safe_switches, auts = triangle_colorings(G)
-    print("analyzing orientations...")
-    per = _analyze_colorings(G, colorings, safe_switches, auts, show=True)
+    if (settings or default_settings())["verbosity"] >= 1:
+        print("analyzing orientations...")
+    per = _analyze_colorings(G, colorings, safe_switches, auts, settings)
     ncand = sum(len(p["candidates"]) for p in per)
     return dict(n=n, k=k, colorings=colorings, per=per, Hstar=Hstar,
                 safe_switches=safe_switches, auts=auts,
@@ -598,6 +631,40 @@ def render_orientation(G, coloring, orient, path, family_key=None, title=""):
                        for c in letters], loc="lower center", ncol=len(letters),
               frameon=False, fontsize=8)
     ax.set_title(title); fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
+
+def render_rejection(G, witness, path, family_key=None, title=""):
+    """Side-by-side panels: the target G, and a same-order complex the pot ALSO
+    assembles that is NOT isomorphic to G -- the witness that rejects the pot
+    under Scenario 3. Loops/parallel edges (if any) are flagged; otherwise a
+    quick invariant (triangle count) is shown so the difference is visible."""
+    import matplotlib.pyplot as plt
+    _pal()                                    # ensure Agg backend
+    loops = [(u, v) for u, v in witness.edges() if u == v]
+    simple = nx.Graph(witness)                # collapse parallels for a clean draw
+    is_multi = getattr(witness, "is_multigraph", lambda: False)()
+    multi = is_multi and simple.number_of_edges() != witness.number_of_edges()
+    pos_g = _layout(G, family_key)
+    pos_w = nx.kamada_kawai_layout(simple) if simple.number_of_nodes() else {}
+
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(10, 5))
+    for ax in (axl, axr):
+        ax.axis("off")
+    nx.draw_networkx_edges(G, pos_g, ax=axl, width=2.0, edge_color="#2a9d55")
+    nx.draw_networkx_nodes(G, pos_g, ax=axl, node_size=90, node_color="#333")
+    nx.draw_networkx_labels(G, pos_g, ax=axl, font_size=8, font_color="white")
+    axl.set_title(f"target $G$   (triangles = {sum(nx.triangles(G).values()) // 3})",
+                  fontsize=10)
+
+    nx.draw_networkx_edges(simple, pos_w, ax=axr, width=2.0, edge_color="#c0392b")
+    nx.draw_networkx_nodes(simple, pos_w, ax=axr, node_size=90, node_color="#333")
+    nx.draw_networkx_labels(simple, pos_w, ax=axr, font_size=8, font_color="white")
+    tag = ("has a loop" if loops else "has a multiedge" if multi
+           else f"triangles = {sum(nx.triangles(simple).values()) // 3}")
+    axr.set_title(f"same-order complex, NOT $\\cong G$   ({tag})", fontsize=10)
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(path, dpi=130); plt.close(fig)
 
 def render_before_after(G, coloring, orient, offender, path, family_key=None, title=""):
     """Two side-by-side panels for one failing swap.
@@ -718,10 +785,11 @@ def _ask(p):
     except EOFError:
         return ""
 
-def explore(label, G, family_key=None):
+def explore(label, G, family_key=None, settings=None):
+    settings = settings if settings is not None else default_settings()
     print(f"\nAnalyzing {label} ({G.number_of_nodes()} vertices, "
           f"{G.number_of_edges()} edges)...")
-    A = analyze_graph(G)
+    A = analyze_graph(G, settings)
     outdir = f"b3_{label.replace('(', '_').replace(')', '')}"
     os.makedirs(outdir, exist_ok=True)
 
@@ -748,8 +816,10 @@ def explore(label, G, family_key=None):
         print("  6. validate candidates  (isomorphism checks -- can be slow)")
         print("  7. try next color up     (exhausts the recolor pile -- can be slow)")
         print("  8. visualize edge-swap (multiedge) failures  [loop-valid, fail only the swap]")
+        print("  9. auto-run: climb + validate until optimal tilings are found")
+        print("  s. settings")
         print("  0. done with this graph")
-        ch = _ask("select: ")
+        ch = _ask("select: ").lower()
 
         if ch == "0" or ch == "":
             return
@@ -760,27 +830,34 @@ def explore(label, G, family_key=None):
         elif ch == "3":
             _viz_orientations(A, G, family_key, outdir)
         elif ch == "4":
-            _dump_matrix_fails(A, outdir, label, G)
+            if _ensure_fails(A, G, settings):
+                _dump_matrix_fails(A, outdir, label, G)
         elif ch == "5":
             _list_candidates(A, G)
         elif ch == "6":
-            _validate(label, A, G, family_key, outdir)
+            _validate(label, A, G, family_key, outdir, settings)
         elif ch == "7":
-            newA = _recolor(label, A, G, family_key, outdir)
+            newA = _recolor(label, A, G, family_key, outdir, settings=settings)
             if newA is not None:
                 A = newA          # advance: bound, k, colorings, viz now reflect k+1
                 print(f"state advanced to k = {A['k']}. The menu now reflects this level.")
         elif ch == "8":
-            _viz_multiedge_fails(A, G, family_key, outdir)
+            if _ensure_fails(A, G, settings):
+                _viz_multiedge_fails(A, G, family_key, outdir)
+        elif ch == "9":
+            A = _autorun(label, A, G, family_key, outdir, settings)
+            print(f"auto-run finished; menu now reflects k = {A['k']}.")
+        elif ch == "s":
+            _settings_menu(settings)
         else:
             print("?")
 
 def _summary(label, A):
     k = A["k"]
     ncand = sum(len(p["candidates"]) for p in A["per"])
-    nmefail = sum(len(p["multiedge_fails"]) for p in A["per"])
-    nisofail = sum(len(p.get("iso_fails", [])) for p in A["per"])
-    nmatfail = sum(len(p["matrix_fails"]) for p in A["per"])
+    nmefail = sum(p["n_multiedge_fails"] for p in A["per"])
+    nisofail = sum(p["n_iso_fails"] for p in A["per"])
+    nmatfail = sum(p["n_matrix_fails"] for p in A["per"])
     print(f"\nB_3({label}) >= {k}.")
     print(f"  {len(A['colorings'])} minimum coloring(s) at k = {k} types.")
     print(f"  candidate pots (passed loop + multiedge + iso + m_P=n): {ncand}")
@@ -792,6 +869,54 @@ def _summary(label, A):
     else:
         print(f"  -> {ncand} candidate(s) exist; validate (menu 6) to confirm B_3 = {k}.")
  
+def _settings_menu(settings):
+    vmap = {0: "quiet", 1: "normal", 2: "verbose"}
+    while True:
+        print("\nsettings (apply to the next analysis / validation):")
+        print(f"  1. verbosity ............... {vmap[settings['verbosity']]}")
+        print(f"  2. retain failure details .. {'on' if settings['retain_fails'] else 'off'}"
+              "   (needed for menus 4 & 8; costs memory)")
+        print(f"  3. progress bars ........... {'on' if settings['progress'] else 'off'}")
+        print(f"  4. validation cap .......... {settings['validate_cap']}")
+        print("  0. back")
+        ch = _ask("toggle: ")
+        if ch in ("0", ""):
+            return
+        elif ch == "1":
+            settings["verbosity"] = (settings["verbosity"] + 1) % 3
+        elif ch == "2":
+            settings["retain_fails"] = not settings["retain_fails"]
+        elif ch == "3":
+            settings["progress"] = not settings["progress"]
+        elif ch == "4":
+            v = _ask("validation cap (positive integer): ")
+            if v.isdigit() and int(v) > 0:
+                settings["validate_cap"] = int(v)
+        else:
+            print("?")
+
+
+def _ensure_fails(A, G, settings):
+    """Menus 4 & 8 need the rejected-orientation DETAILS. If they weren't retained
+    (the memory-saving default), recompute this level with retention on -- but only
+    once the user has enabled it in settings. Returns True when details are ready."""
+    have = any(p["matrix_fails"] or p["multiedge_fails"] or p["iso_fails"] for p in A["per"])
+    if have:
+        return True
+    counts = sum(p["n_matrix_fails"] + p["n_multiedge_fails"] + p["n_iso_fails"]
+                 for p in A["per"])
+    if counts == 0:
+        return True                         # nothing was rejected; caller shows 'none'
+    if not settings["retain_fails"]:
+        print("failure details were not retained (saves memory). Turn on "
+              "'retain failure details' in settings (s), then retry this option.")
+        return False
+    print("recomputing this level with failure details retained...")
+    A["per"] = _analyze_colorings(G, A["colorings"], A.get("safe_switches"),
+                                  A.get("auts"), settings)
+    return True
+
+
 def _viz_multiedge_fails(A, G, family_key, outdir):
     # one before/after per (orientation, offending swap)
     jobs = [(ci, orient, off) for ci, p in enumerate(A["per"], 1)
@@ -874,24 +999,24 @@ def _list_candidates(A, G):
     if tot == 0:
         print("  no candidates at this level.")
 
-def _validate(label, A, G, family_key, outdir):
-    cands = [(ci, orient) for ci, p in enumerate(A["per"], 1)
-             for (orient, *_ ) in p["candidates"]]
-    if not cands:
-        print("no candidates to validate."); return
-    if not _confirm(f"validate {len(cands)} candidate(s) with isomorphism checks? "
-                    "this can be expensive"):
-        return
-    found = 0; rejected = 0; undecided = 0
-    prog = _Progress(len(cands), "validating")
-    for ci, orient in cands:
-        prog.tick()
-        coloring = A["per"][ci - 1]["coloring"]
-        res = validate_candidate(G, coloring, orient)
-        if res is None:
+def _run_validation(label, A, G, family_key, outdir, settings=None):
+    """Run the complete Scenario-3 test on every candidate of A, writing an
+    optimal-tiling file + PNG for each certified pot. No prompts. Returns
+    (found, rejects, undecided); rejects is a list of (ci, coloring, orient,
+    witness) for the caller to render or count."""
+    settings = settings or default_settings()
+    cap = settings["validate_cap"]; verb = settings["verbosity"]
+    cands = [(ci, p["coloring"], o) for ci, p in enumerate(A["per"], 1)
+             for (o, *_ ) in p["candidates"]]
+    found = 0; undecided = 0; rejects = []
+    prog = _Progress(len(cands), "validating") if settings["progress"] and verb >= 1 else None
+    for ci, coloring, orient in cands:
+        if prog: prog.tick()
+        verdict, witness = scenario3_check(G, coloring, orient, cap=cap)
+        if verdict is None:
             undecided += 1; continue
-        if res is False:
-            rejected += 1; continue                # builds a non-iso same-order complex
+        if verdict is False:
+            rejects.append((ci, coloring, orient, witness)); continue  # non-iso same-order complex
         found += 1
         setf, arcs = pot_text(G, coloring, orient)
         txt = os.path.join(outdir, f"optimal_tiling_{found}.txt")
@@ -901,22 +1026,88 @@ def _validate(label, A, G, family_key, outdir):
         png = os.path.join(outdir, f"optimal_tiling_{found}.png")
         render_orientation(G, coloring, orient, png, family_key,
                            f"optimal tiling {found}: {label}")
-        print(f"\n  OPTIMAL TILING {found}:  {setf}")
-        print(f"    wrote {txt} , {png}")
-    prog.close()
-    if rejected:
-        print(f"\n{rejected} candidate(s) rejected: they build a non-isomorphic complex "
+        if verb >= 1:
+            print(f"\n  OPTIMAL TILING {found}:  {setf}")
+            print(f"    wrote {txt} , {png}")
+    if prog: prog.close()
+    return found, rejects, undecided
+
+
+def _validate(label, A, G, family_key, outdir, settings=None):
+    settings = settings or default_settings()
+    ncand = sum(len(p["candidates"]) for p in A["per"])
+    if not ncand:
+        print("no candidates to validate."); return
+    if not _confirm(f"validate {ncand} candidate(s) with isomorphism checks? "
+                    "this can be expensive"):
+        return
+    found, rejects, undecided = _run_validation(label, A, G, family_key, outdir, settings)
+    if rejects:
+        print(f"\n{len(rejects)} candidate(s) rejected: they build a non-isomorphic complex "
               "of the same order (m_P = n is necessary but NOT sufficient for Scenario 3).")
+        _show_rejections(label, G, rejects, family_key, outdir)
     if undecided:
         print(f"{undecided} candidate(s) undecided (enumeration exceeded the cap).")
     if found:
         print(f"\n{found} optimal tiling(s) certified. B_3({label}) = {A['k']} achieved.")
-    elif undecided and not rejected:
+    elif undecided and not rejects:
         print(f"\nno candidate certified within the cap; result inconclusive.")
     else:
         print(f"\nall candidates rejected. B_3({label}) >= {A['k'] + 1}.")
 
-def _recolor(label, A, G, family_key, outdir, color_cap=1e6):
+
+def _autorun(label, A, G, family_key, outdir, settings=None, max_levels=8):
+    """Keep climbing color counts, validating at each level, until certified
+    optimal tilings appear -- that level is B_3 -- or we can climb no further.
+    Non-interactive apart from a final offer to view any rejected pots."""
+    settings = settings or default_settings()
+    print(f"\nauto-run: climbing from k = {A['k']} until an optimal tiling is certified...")
+    for _ in range(max_levels):
+        k = A["k"]
+        ncand = sum(len(p["candidates"]) for p in A["per"])
+        found, rejects, undecided = _run_validation(label, A, G, family_key, outdir, settings)
+        print(f"  k = {k}: {ncand} candidate(s) -> {found} certified, "
+              f"{len(rejects)} rejected, {undecided} undecided")
+        if found:
+            print(f"\nOPTIMAL FOUND: B_3({label}) = {k}. "
+                  f"{found} optimal tiling(s) written to {outdir}/.")
+            if rejects:
+                print(f"({len(rejects)} pot(s) at this level were rejected as non-unique.)")
+                _show_rejections(label, G, rejects, family_key, outdir)
+            return A
+        if undecided and not rejects:
+            print("  stopped: candidates undecided at the enumeration cap; "
+                  "cannot certify. Raise the cap and retry.")
+            return A
+        newA = _recolor(label, A, G, family_key, outdir, auto=True, settings=settings)
+        if newA is None:
+            print("  stopped: cannot climb further (exhaustive proof or cap reached).")
+            return A
+        A = newA
+    print(f"  stopped: reached the level cap ({max_levels}) without certifying.")
+    return A
+
+
+def _show_rejections(label, G, rejects, family_key, outdir):
+    """Offer to draw each rejected pot: target G beside the same-order complex it
+    also assembles that is not isomorphic to G."""
+    if not _confirm(f"view the {len(rejects)} rejected pot(s) -- target G vs the "
+                    "non-isomorphic complex it also builds?"):
+        return
+    for idx, (ci, coloring, orient, witness) in enumerate(rejects, 1):
+        setf, _ = pot_text(G, coloring, orient)
+        png = os.path.join(outdir, f"rejected_{idx}.png")
+        render_rejection(G, witness, png, family_key, f"rejected pot {idx}: {label}")
+        txt = os.path.join(outdir, f"rejected_{idx}.txt")
+        with open(txt, "w") as f:
+            f.write(f"REJECTED POT for {label}  (builds a non-isomorphic same-order "
+                    f"complex)\n\n{setf}\n\nwitness complex edges:\n" +
+                    " ".join(f"{u}-{v}" for u, v in sorted(map(tuple, map(sorted,
+                             witness.edges())))) + "\n")
+        print(f"  rejected pot {idx}:  {setf}")
+        print(f"    wrote {png} , {txt}")
+
+def _recolor(label, A, G, family_key, outdir, color_cap=1e6, auto=False, settings=None):
     """Advance one level, k -> k+1, by a COMPLETE enumeration of the proper
     (k+1)-colorings of the conflict graph (deduped under Aut(G)). A valid (k+1)
     coloring need NOT be a single-edge refinement of a k-coloring -- the prism is
@@ -924,13 +1115,14 @@ def _recolor(label, A, G, family_key, outdir, color_cap=1e6):
     candidate means B_3 could be k+1 (validate to confirm); an exhaustive
     enumeration with no candidate proves B_3 >= k+2. One level per call.
     Returns the advanced analysis dict, or None if declined."""
+    settings = settings or default_settings()
     k = A["k"]; Hstar = A.get("Hstar"); safe_switches = A.get("safe_switches")
     auts = A.get("auts")
     if Hstar is None or safe_switches is None:
         _, H0, amb = sc.analyze(G); Hstar, _, safe_switches = sc.complete_conflicts(G, H0, amb)
     if auts is None:
         auts = sc.automorphisms(G, cap=20000)
-    if not _confirm(f"enumerate ALL proper {k+1}-colorings and analyze them "
+    if not auto and not _confirm(f"enumerate ALL proper {k+1}-colorings and analyze them "
                     f"(exhaustive; proves B_3 >= {k+2} if none works)? can be slow"):
         return None
     parts = sc.enumerate_colorings(Hstar, k + 1, cap=color_cap)
@@ -944,8 +1136,9 @@ def _recolor(label, A, G, family_key, outdir, color_cap=1e6):
                 cd[sc.ekey(*e)] = i
         if len(set(cd.values())) == k + 1:          # actually uses k+1 types
             colorings.append(cd)
-    print(f"analyzing {len(colorings)} coloring(s) at k = {k+1}...")
-    per = _analyze_colorings(G, colorings, safe_switches, auts, show=True)
+    if settings["verbosity"] >= 1:
+        print(f"analyzing {len(colorings)} coloring(s) at k = {k+1}...")
+    per = _analyze_colorings(G, colorings, safe_switches, auts, settings)
     ncand = sum(len(q["candidates"]) for q in per)
     if ncand > 0:
         proven = k + 1
@@ -1048,8 +1241,9 @@ def main():
     if not items:
         print("no valid graphs to analyze."); return
 
+    settings = default_settings()          # persists across graphs in this run
     for label, G in items:
-        explore(label, G, family_key)
+        explore(label, G, family_key, settings)
 
 if __name__ == "__main__":
     main()
